@@ -1,0 +1,6 @@
+[server]
+maxUploadSize = 500
+primaryColor = "#4a9eff"  # 여기서 메인 색상(파란색)을 지정
+backgroundColor = "#0a0a0a"
+secondaryBackgroundColor = "#121212"
+textColor = "#ffffff"
