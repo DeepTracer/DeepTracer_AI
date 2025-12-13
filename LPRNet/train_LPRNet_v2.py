@@ -265,7 +265,6 @@ def Greedy_Decode_Eval(Net, datasets, args):
                 pre_c = c
             preb_labels.append(no_repeat_blank_label)
             
-        # [디버깅] 이제 i가 덮어씌워지지 않으므로 정상 작동함
         if batch_i == 0:
             for k in range(min(5, len(preb_labels))):
                 real_target = "".join([CHARS[idx] for idx in targets[k]])

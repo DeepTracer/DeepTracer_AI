@@ -211,3 +211,5 @@ __marimo__/
 *.mp4
 *.png
 *.json
+
+DeepTracer_dataset/

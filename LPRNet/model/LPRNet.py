@@ -103,7 +103,7 @@ class LPRNet(nn.Module):
         return x
 
     def forward(self, x):
-        # [NEW] 입력 이미지를 먼저 STN으로 펴줍니다!
+        # 입력 이미지를 먼저 STN으로 펴줌
         x = self.stn(x)
 
         keep_features = list()
