@@ -139,7 +139,7 @@ def Greedy_Decode_Eval(Net, datasets, args):
             if print_count < 100:
                 target_text = "".join([CHARS[int(idx)] for idx in target_seq])
                 pred_text = "".join([CHARS[idx] for idx in label])
-                check = "🟢" if target_text == pred_text else "🔴"
+                check = "정답" if target_text == pred_text else "오답"
                 print(f"정답: {target_text:<10}  vs  예측: {pred_text:<10} => {check}")
                 print_count += 1
 

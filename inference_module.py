@@ -11,32 +11,25 @@ import sys
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
+sys.path.insert(0, os.path.abspath('./LPRNet'))
+from model.LPRNet import build_lprnet
+from data.load_data import CHARS
+
 # =========================================================
 # 1. 환경 설정
 # =========================================================
 
-ORIGINAL_DIR = os.getcwd()
-DTR_PATH = os.path.abspath('./deep-text-recognition-benchmark')
-sys.path.insert(0, DTR_PATH)
-
-os.chdir(DTR_PATH)
-try:
-    from inference import inference, load_text_recognition_model
-    print("OCR 모듈 import 성공")
-except ImportError as e:
-    print(f"오류: {e}")
-    print("   deep-text-recognition-benchmark 폴더 구조를 확인하세요.")
-    print("   필요한 폴더: modules/, model.py, inference.py 등")
-    sys.exit()
-finally:
-    os.chdir(ORIGINAL_DIR)  # 원래 디렉토리로 복귀
+sys.path.insert(0, os.path.abspath('./LPRNet'))
+from model.LPRNet import build_lprnet
+from data.load_data import CHARS
+print("LPRNet 모듈 import 성공")
 
 # [모델 경로]
 YOLO_WEIGHTS = 'runs/detect/train6/weights/best.pt'
-OCR_WEIGHTS = os.path.abspath("./weights/vgg__high_best_accuracy.pth")
+OCR_WEIGHTS = os.path.abspath("./LPRNet/weights/Final_LPRNet_model.pth")
 
 # [파라미터]
-CONFIDENCE_THRESHOLD = 0.35 
+CONFIDENCE_THRESHOLD = 0.35
 OCR_CONFIDENCE_THRESHOLD = 0.3
 SKIP_FRAMES = 5
 
@@ -47,15 +40,15 @@ else:
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# OCR 전처리
-ocr_transform = A.Compose([
-    A.Resize(32, 100),
-    A.Normalize(mean=0, std=1),
-    ToTensorV2()
-])
-
 # 번호판 정규식 
 plate_pattern = re.compile(r"\D{0,5}\d{0,3}\D{1}\d{4}$")
+
+def load_lprnet_model(weights_path, device):
+    lprnet = build_lprnet(lpr_max_len=8, phase=False, class_num=len(CHARS), dropout_rate=0)
+    lprnet.load_state_dict(torch.load(weights_path, map_location=device))
+    lprnet.to(device)
+    lprnet.eval()
+    return lprnet
 
 # =========================================================
 # 함수 정의
@@ -117,18 +110,42 @@ def transform_vertical_plate(plate_img):
     return plate_img
 
 def run_ocr(model, image):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    input_tensor = ocr_transform(image=gray)["image"]
-    ocr_result, confidence_score = inference(model=model, input_tensor=input_tensor, device="cuda")
+    # LPRNet 입력: 128x32, BGR
+    img = cv2.resize(image, (128, 32))
+    img = img.astype('float32')
+    img -= 127.5
+    img /= 128.0
+    img = np.transpose(img, (2, 0, 1))
+    img = torch.from_numpy(img).unsqueeze(0).to(DEVICE)
     
-    text = ocr_result[0]
-    conf = confidence_score[0]
+    with torch.no_grad():
+        prebs = model(img)
+    prebs = prebs.cpu().numpy()
+    
+    preb = prebs[0]
+    preb_label = [np.argmax(preb[:, j]) for j in range(preb.shape[1])]
+    
+    no_repeat_blank_label = []
+    pre_c = preb_label[0]
+    if pre_c != len(CHARS) - 1:
+        no_repeat_blank_label.append(pre_c)
+    for c in preb_label:
+        if (pre_c == c) or (c == len(CHARS) - 1):
+            pre_c = c
+            continue
+        no_repeat_blank_label.append(c)
+        pre_c = c
+    
+    text = "".join([CHARS[idx] for idx in no_repeat_blank_label])
+    
+    probs = np.exp(preb) / np.sum(np.exp(preb), axis=0)
+    conf = np.mean([probs[preb_label[j], j] for j in range(len(preb_label))])
     
     res = plate_pattern.match(text)
     if not (6 < len(text) < 11 and res):
         text = "invalid"
     
-    return text, conf
+    return text, float(conf)
 
 def draw_text(img, text, x, y, color=(0,255,0)):
     img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
@@ -187,10 +204,7 @@ def run_plate_detection(video_path, output_dir, progress_callback=None):
     # 모델 로딩
     print("모델 로딩...")
     yolo = YOLO(YOLO_WEIGHTS)
-    ocr_model = load_text_recognition_model(
-        save_model=OCR_WEIGHTS,
-        device="cuda"
-    )
+    ocr_model = load_lprnet_model(OCR_WEIGHTS, DEVICE)
     print("OCR 모델 로드 완료")
 
     # 비디오 열기
@@ -392,7 +406,7 @@ if __name__ == "__main__":
         output_dir = sys.argv[2]
     else:
         # 기본값
-        video_path = './주주주주행.mp4'
+        video_path = './주행.mp4'
         output_dir = "results"
     
     run_plate_detection(video_path, output_dir)

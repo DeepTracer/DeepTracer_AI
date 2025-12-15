@@ -20,7 +20,6 @@ CHARS_DICT = {char:i for i, char in enumerate(CHARS)}
 
 class LPRDataLoader(Dataset):
     def __init__(self, img_dirs, imgSize, lpr_max_len=None, is_train=True):
-        # img_dirs는 리스트 형태로 들어옵니다 (예: ['./data/train'])
         self.img_dirs = img_dirs
         self.img_paths = []
         self.img_size = imgSize
@@ -37,9 +36,9 @@ class LPRDataLoader(Dataset):
                     if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
                         self.img_paths.append(os.path.join(img_dir, f))
             else:
-                print(f"⚠️ 경로를 찾을 수 없음 (건너뜀): {img_dir}")
+                print(f"경로를 찾을 수 없음 (건너뜀): {img_dir}")
 
-        print(f"✅ 총 {len(self.img_paths)}장의 이미지를 로드했습니다.")
+        print(f"총 {len(self.img_paths)}장의 이미지를 로드했습니다.")
 
     def __len__(self):
         return len(self.img_paths)
