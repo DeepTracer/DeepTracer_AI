@@ -221,63 +221,61 @@ def run_inference(video_path, output_dir, progress_bar=None, progress_text=None)
     추론 실행 - subprocess로 inference_module.py 호출
     """
     import subprocess
+    import sys # 상단에 없다면 추가
     
     try:
-        # 결과 파일 경로 미리 계산
         file_name = os.path.splitext(os.path.basename(video_path))[0]
         result_video = os.path.join(output_dir, f"{file_name}_result.mp4")
         result_json = os.path.join(output_dir, f"{file_name}_result.json")
         
-        # 총 프레임 수 계산
         cap = cv2.VideoCapture(video_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         cap.release()
         
-        # subprocess로 추론 모듈 실행
         current_dir = os.path.dirname(os.path.abspath(__file__))
         inference_script = os.path.join(current_dir, "inference_module.py")
         
+        # [수정] sys.executable을 사용하여 현재 아나콘다 환경의 파이썬을 정확히 호출
         process = subprocess.Popen(
-            ["python", inference_script, video_path, output_dir],
+            [sys.executable, inference_script, video_path, output_dir],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            bufsize=1
+            bufsize=1,
+            encoding='utf-8' # 인코딩 명시
         )
         
-        # 실시간으로 출력 읽으면서 진행률 업데이트
+        last_line = ""
         for line in process.stdout:
-            print(line.strip())
+            last_line = line.strip()
+            print(last_line) # 터미널 로그 출력
             
-            # "Processing 현재/전체" 패턴 찾기
             if "Processing" in line and "/" in line:
                 try:
                     parts = line.split("Processing")[1].strip().split("/")
-                    current_frame = int(parts[0].strip())
-                    
+                    current_frame = int(parts[0].split("(")[0].strip()) # (00:00:01) 등 시간표시 제외
                     progress = current_frame / total_frames
                     if progress_bar:
-                        progress_bar.progress(min(progress, 0.95))
+                        progress_bar.progress(min(progress, 0.99))
                     if progress_text:
-                        progress_text.text(f"{current_frame}/{total_frames} ({progress*100:.1f}%)")
+                        progress_text.text(f"분석 중: {current_frame}/{total_frames} 프레임")
                 except:
                     pass
         
         process.wait()
         
-        # 결과 확인
+        # [중요] 프로세스가 종료되었는데 JSON이 없다면 에러 메시지 출력
         if os.path.exists(result_json):
             with open(result_json, 'r', encoding='utf-8') as f:
                 json_data = json.load(f)
             return result_video, result_json, json_data
         else:
-            st.error(f"JSON 파일이 생성되지 않았습니다.")
+            # 마지막 로그를 보여줘서 왜 죽었는지 힌트를 줌
+            st.error(f"추론 모듈 실행 실패. 마지막 로그: {last_line}")
             return None, None, None
         
     except Exception as e:
-        st.error(f"추론 중 오류 발생: {e}")
-        import traceback
-        st.code(traceback.format_exc())
+        st.error(f"앱 실행 오류: {e}")
         return None, None, None
 
 
@@ -321,12 +319,10 @@ with st.sidebar:
             with st.sidebar:
                 st.markdown("---")
                 
-                # ▼▼▼ [중요] 이 두 줄이 꼭 있어야 합니다! ▼▼▼
                 progress_text = st.empty()   # 글자가 뜰 공간 만들기
                 progress_bar = st.progress(0) # 진행바 만들기
-                # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
                 
-                # 2. 로딩 메시지 띄우기 (이제 변수가 있으니 에러가 안 납니다)
+                # 2. 로딩 메시지 띄우기
                 progress_text.markdown("AI 모델 로딩 중... (잠시만 기다려주세요)")
             
             # 출력 디렉토리 생성
@@ -356,12 +352,11 @@ with st.sidebar:
     
     # JSON 다운로드 버튼
     if st.session_state["json_data"]:
-        # 여백을 위한 얇은 선 (취향껏)
+        # 여백을 위한 얇은 선
         st.markdown('<div style="border-top: 1px solid #333; margin-top: 10px; margin-bottom: 20px;"></div>', unsafe_allow_html=True)
         
         json_str = json.dumps(st.session_state["json_data"], ensure_ascii=False, indent=4)
         
-        # ▼▼▼ [수정] 양옆에 1만큼 여백을 주고, 가운데(2)에 버튼을 놓음 ▼▼▼
         st.markdown('<div style="border-top: ; margin-top: 20px; margin-bottom: 10px;"></div>', unsafe_allow_html=True)
         col1, col2, col3 = st.columns([1, 2, 1]) 
         with col2:
@@ -397,7 +392,6 @@ with st.sidebar:
         c1, prev_col, next_col, c4 = st.columns([0.5, 2, 2, 0.5])
         
         with prev_col:
-            # use_container_width=True를 써야 칸에 꽉 차서 예쁩니다
             if st.button("◀  이전 프레임", use_container_width=True):
                 st.session_state["current_frame"] = max(0, current_frame - 5)
                 st.session_state["current_plate_idx"] = 0
@@ -525,7 +519,7 @@ else:
     # 결과 영상 다운로드 버튼
     if st.session_state.get("result_video_path") and os.path.exists(st.session_state["result_video_path"]):
         
-        # ▼▼▼ 글꼴/크기 변경 스타일 코드 ▼▼▼
+        
         st.markdown("""
         <style>
         /* 1. 메인 화면 버튼 글자 설정 */
@@ -554,7 +548,6 @@ else:
         }
         </style>
         """, unsafe_allow_html=True)
-        # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
 
         with open(st.session_state["result_video_path"], 'rb') as f:
             st.download_button(
@@ -562,7 +555,7 @@ else:
                 data=f.read(),
                 file_name="result_video.mp4",
                 mime="video/mp4",
-                use_container_width=False # 버튼 꽉 차게 하려면 이거 유지하세요
+                use_container_width=False 
             )
     
     st.markdown("---")
@@ -761,6 +754,6 @@ st.markdown("""
     font-weight: 500;
     margin-top: 40px;
 ">
-    DeepTracer | Powered by YOLOv8n + LPRNet
+    DeepTracer | Powered by YOLOv8n
 </div>
 """, unsafe_allow_html=True)
