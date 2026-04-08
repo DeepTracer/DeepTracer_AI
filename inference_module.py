@@ -5,59 +5,138 @@ import re
 import torch
 import json
 import base64
+import sys
+import subprocess
+import shutil
+from collections import OrderedDict
 from ultralytics import YOLO
 from PIL import Image, ImageDraw, ImageFont
-import sys
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
-
-sys.path.insert(0, os.path.abspath('./LPRNet'))
-from model.LPRNet import build_lprnet
-from data.load_data import CHARS
+from torchvision import transforms
 
 # =========================================================
-# 1. 환경 설정
+# 1. 시스템 경로 설정 (하이픈 폴더 및 모듈 로딩 해결)
 # =========================================================
+benchmark_path = os.path.abspath("./deep-text-recognition-benchmark")
+if benchmark_path not in sys.path:
+    sys.path.insert(0, benchmark_path)
 
-sys.path.insert(0, os.path.abspath('./LPRNet'))
-from model.LPRNet import build_lprnet
-from data.load_data import CHARS
-print("LPRNet 모듈 import 성공")
+# 이제 하이픈이 포함된 폴더 안의 파일들을 직접 import 할 수 있습니다.
+from utils import AttnLabelConverter
+from text_recognition_model import TextRecognitionModel
 
-# [모델 경로]
+# =========================================================
+# 2. 환경 설정 및 모델 경로
+# =========================================================
+# YOLO 및 OCR 모델 가중치 경로
 YOLO_WEIGHTS = 'runs/detect/train6/weights/best.pt'
-OCR_WEIGHTS = os.path.abspath("./LPRNet/weights/Final_LPRNet_model.pth")
+OCR_WEIGHTS = os.path.abspath("./deep-text-recognition-benchmark/saved_models/sec_train/best_accuracy.pth")
 
-# [파라미터]
+# 추론 파라미터
 CONFIDENCE_THRESHOLD = 0.35
 OCR_CONFIDENCE_THRESHOLD = 0.3
 SKIP_FRAMES = 5
 
+# [중요] 학습 시 사용한 96개 글자 (점 '.' 제외)
+# 10개 숫자 + 86개 한글 = 총 96개 (모델 num_class는 98이 됨)
+CHARACTER_SETS = "0123456789가강거경계고관광구금기김나남너노누다대더도동두등라러로루리마머명모무문미바배뱌버보부북사산서소수아악안양어연영오용우울원육이인자작저전조주중지차천초추충카타파평포하허호홀히"
+
+# 폰트 경로 설정
 if os.name == 'nt': 
     FONT_PATH = "C:/Windows/Fonts/malgun.ttf"
 else: 
     FONT_PATH = "/usr/share/fonts/truetype/nanum/NanumGothic.ttf"
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-# 번호판 정규식 
 plate_pattern = re.compile(r"\D{0,5}\d{0,3}\D{1}\d{4}$")
 
-def load_lprnet_model(weights_path, device):
-    lprnet = build_lprnet(lpr_max_len=8, phase=False, class_num=len(CHARS), dropout_rate=0)
-    lprnet.load_state_dict(torch.load(weights_path, map_location=device))
-    lprnet.to(device)
-    lprnet.eval()
-    return lprnet
+# =========================================================
+# 3. 모델 로딩 함수 (가중치 이름표 불일치 해결)
+# =========================================================
+
+def load_trained_ocr_model(weights_path, device):
+    """
+    학습된 STR 모델을 로드합니다. (입력 채널 1, 글자수 96개 최적화)
+    """
+    converter = AttnLabelConverter(CHARACTER_SETS)
+    num_class = len(converter.character) # [GO]와 [s]가 포함된 숫자
+    
+    # 모델 뼈대 생성 (학습된 체크포인트 사양과 일치시킴)
+    model = TextRecognitionModel(
+        Transformation='TPS',
+        FeatureExtraction='ResNet',
+        SequenceModeling='BiLSTM',
+        Prediction='Attn',
+        num_fiducial=20,
+        img_scale=(32, 100), 
+        input_channel=1,     # 흑백 모델 (체크포인트 규격)
+        output_channel=512,
+        hidden_size=256,
+        num_class=num_class,
+        batch_max_length=25
+    )
+    
+    if not os.path.exists(weights_path):
+        raise FileNotFoundError(f"가중치 파일을 찾을 수 없습니다: {weights_path}")
+    
+    # 가중치 로드 및 이름표(module.) 정제
+    state_dict = torch.load(weights_path, map_location=device)
+    new_state_dict = OrderedDict()
+    for k, v in state_dict.items():
+        name = k[7:] if k.startswith('module.') else k
+        new_state_dict[name] = v
+    
+    model.load_state_dict(new_state_dict)
+    print(f"✅ OCR 모델 가중치 로드 성공! (입력 채널: 1, 클래스: {num_class})")
+    
+    # GPU 가속 설정
+    model = torch.nn.DataParallel(model).to(device)
+    model.eval()
+    return model, converter
 
 # =========================================================
-# 함수 정의
+# 4. 핵심 추론 및 유틸리티 함수
 # =========================================================
+
+def run_ocr(model, converter, image):
+    """
+    학습된 모델을 사용해 번호판 글자 인식 (흑백 변환 포함)
+    """
+    # 1. 전처리: 흑백 변환 및 리사이즈
+    img = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) 
+    img = cv2.resize(img, (100, 32))
+    
+    # 2. 텐서 변환 및 정규화
+    img_tensor = transforms.ToTensor()(img).unsqueeze(0).to(DEVICE)
+    img_tensor.sub_(0.5).div_(0.5)
+
+    batch_size = 1
+    with torch.no_grad():
+        # Attention 예측을 위한 빈 텐서 준비
+        length_for_pred = torch.IntTensor([25] * batch_size).to(DEVICE)
+        text_for_pred = torch.LongTensor(batch_size, 25 + 1).fill_(0).to(DEVICE)
+        
+        # 모델 추론
+        preds = model(img_tensor, text_for_pred, is_train=False)
+        
+        # 결과 디코딩
+        _, preds_index = preds.max(2)
+        preds_str = converter.decode(preds_index, length_for_pred)
+        
+        # 결과 텍스트 후처리 ([s] 제거)
+        text = preds_str[0]
+        if '[s]' in text:
+            text = text[:text.find('[s]')]
+            
+        # 신뢰도 점수 계산
+        preds_prob = torch.nn.functional.softmax(preds, dim=2)
+        preds_max_prob, _ = preds_prob.max(dim=2)
+        conf = preds_max_prob[0].cumprod(dim=0)[-1].item()
+        
+    return text, float(conf)
 
 def image_to_base64(img):
     _, buffer = cv2.imencode('.jpg', img)
-    img_str = base64.b64encode(buffer).decode('utf-8')
-    return img_str
+    return base64.b64encode(buffer).decode('utf-8')
 
 def get_time_str(msec):
     seconds = int(msec / 1000)
@@ -66,347 +145,157 @@ def get_time_str(msec):
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 def detect_with_slicing(model, frame, confidence=0.25):
-    height, width, _ = frame.shape
-    mid_x = width // 2  
-    results_coords = [] 
+    """ YOLO를 사용하여 프레임을 반으로 나눠 정밀 검출 """
+    h, w, _ = frame.shape
+    mid_x, overlap = w // 2, 100
+    results_coords = []
     
-    overlap = 100 
-    left_img = frame[:, 0 : mid_x + overlap]
-    results_left = model(left_img, conf=confidence, verbose=False)
-    for result in results_left:
-        for box in result.boxes:
-            coords = box.xyxy[0].cpu().tolist()
-            conf = box.conf.item()
-            results_coords.append(coords + [conf])
-
-    right_img = frame[:, mid_x - overlap : width]
-    results_right = model(right_img, conf=confidence, verbose=False)
-    for result in results_right:
-        for box in result.boxes:
-            coords = box.xyxy[0].cpu().tolist()
-            conf = box.conf.item()
-            coords[0] += (mid_x - overlap)
-            coords[2] += (mid_x - overlap)
-            results_coords.append(coords + [conf])
-
+    # 왼쪽/오른쪽 슬라이싱 검출
+    for start_x, end_x, offset in [(0, mid_x + overlap, 0), (mid_x - overlap, w, mid_x - overlap)]:
+        slice_img = frame[:, start_x:end_x]
+        results = model(slice_img, conf=confidence, verbose=False)
+        for res in results:
+            for box in res.boxes:
+                c = box.xyxy[0].cpu().tolist()
+                c[0] += offset; c[2] += offset
+                results_coords.append(c + [box.conf.item()])
     return results_coords
 
 def transform_vertical_plate(plate_img):
-    h, w, c = plate_img.shape
-    aspect_ratio = w / h
-    if aspect_ratio > 2.5: return plate_img
-
+    """ 2단 번호판을 1단으로 변환 """
+    h, w, _ = plate_img.shape
+    if w / h > 2.5: return plate_img
     hsv = cv2.cvtColor(plate_img, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, np.array([15, 100, 100]), np.array([40, 255, 255]))
-    
     if cv2.countNonZero(mask) / (w * h) > 0.3:
-        split_point = int(w * 0.25) 
-        left = plate_img[:, :split_point]
-        right = plate_img[:, split_point:]
+        split = int(w * 0.25)
+        left, right = plate_img[:, :split], plate_img[:, split:]
         top = cv2.resize(left[:h//2, :], (w//4, h))
         bot = cv2.resize(left[h//2:, :], (w//4, h))
-        new_left = cv2.resize(np.hstack([top, bot]), (int(w*0.3), h))
-        return np.hstack([new_left, right])
+        return np.hstack([cv2.resize(np.hstack([top, bot]), (int(w*0.3), h)), right])
     return plate_img
 
-def run_ocr(model, image):
-    # LPRNet 입력: 128x32, BGR
-    img = cv2.resize(image, (128, 32))
-    img = img.astype('float32')
-    img -= 127.5
-    img /= 128.0
-    img = np.transpose(img, (2, 0, 1))
-    img = torch.from_numpy(img).unsqueeze(0).to(DEVICE)
-    
-    with torch.no_grad():
-        prebs = model(img)
-    prebs = prebs.cpu().numpy()
-    
-    preb = prebs[0]
-    preb_label = [np.argmax(preb[:, j]) for j in range(preb.shape[1])]
-    
-    no_repeat_blank_label = []
-    pre_c = preb_label[0]
-    if pre_c != len(CHARS) - 1:
-        no_repeat_blank_label.append(pre_c)
-    for c in preb_label:
-        if (pre_c == c) or (c == len(CHARS) - 1):
-            pre_c = c
-            continue
-        no_repeat_blank_label.append(c)
-        pre_c = c
-    
-    text = "".join([CHARS[idx] for idx in no_repeat_blank_label])
-    
-    probs = np.exp(preb) / np.sum(np.exp(preb), axis=0)
-    conf = np.mean([probs[preb_label[j], j] for j in range(len(preb_label))])
-    
-    res = plate_pattern.match(text)
-    if not (6 < len(text) < 11 and res):
-        text = "invalid"
-    
-    return text, float(conf)
-
 def draw_text(img, text, x, y, color=(0,255,0)):
+    """ 이미지 위에 한글 번호판 텍스트 그리기 """
     img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
     draw = ImageDraw.Draw(img_pil)
-    try: 
-        font = ImageFont.truetype(FONT_PATH, 30)
-    except: 
-        font = ImageFont.load_default()
+    try: font = ImageFont.truetype(FONT_PATH, 30)
+    except: font = ImageFont.load_default()
     draw.rectangle(draw.textbbox((x, y-35), text, font=font), fill=(0,0,0,150))
     draw.text((x, y-35), text, font=font, fill=color)
     return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
 def enhance_for_motion_blur(img):
+    """ 화질 개선 (CLAHE 및 샤프닝) """
     img_yuv = cv2.cvtColor(img, cv2.COLOR_BGR2YUV)
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
     img_yuv[:,:,0] = clahe.apply(img_yuv[:,:,0])
-    img = cv2.cvtColor(img_yuv, cv2.COLOR_YUV2BGR)
-
-    gaussian = cv2.GaussianBlur(img, (0, 0), 3.0)
-    img = cv2.addWeighted(img, 1.5, gaussian, -0.5, 0)
-
-    return img
-
+    res = cv2.cvtColor(img_yuv, cv2.COLOR_YUV2BGR)
+    return cv2.addWeighted(res, 1.5, cv2.GaussianBlur(res, (0,0), 3.0), -0.5, 0)
 
 # =========================================================
-# 메인 추론 함수 (Streamlit에서 호출)
+# 5. 메인 실행 함수 (run_plate_detection)
 # =========================================================
+
 def run_plate_detection(video_path, output_dir, progress_callback=None):
-    """
-    번호판 검출 추론 실행
+    print(f"🚀 실행 장치: {DEVICE}")
     
-    Args:
-        video_path: 입력 영상 경로
-        output_dir: 결과 저장 디렉토리
-        progress_callback: 진행률 콜백 함수 (optional) - progress_callback(current, total)
+    # 모델 로드
+    yolo = YOLO(YOLO_WEIGHTS)
+    ocr_model, ocr_converter = load_trained_ocr_model(OCR_WEIGHTS, DEVICE)
+
+    # 비디오 준비
+    cap = cv2.VideoCapture(video_path)
+    width, height = int(cap.get(3)), int(cap.get(4))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps == 0 or np.isnan(fps): fps = 24.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
-    Returns:
-        result_video_path: 결과 영상 경로
-        result_json_path: 결과 JSON 경로
-        json_data: 검출 결과 리스트
-    """
-    print(f"Device: {DEVICE}")
-    print(f"입력 파일: {video_path}")
-    
-    # 출력 경로 설정
-    file_name_with_ext = os.path.basename(video_path)
-    file_name_only = os.path.splitext(file_name_with_ext)[0]
-    
+    file_name = os.path.splitext(os.path.basename(video_path))[0]
     os.makedirs(output_dir, exist_ok=True)
     capture_dir = os.path.join(output_dir, "captured_plates")
     os.makedirs(capture_dir, exist_ok=True)
     
-    result_video_path = os.path.join(output_dir, f"{file_name_only}_result.mp4")
-    result_json_path = os.path.join(output_dir, f"{file_name_only}_result.json")
+    result_video_path = os.path.join(output_dir, f"{file_name}_result.mp4")
+    result_json_path = os.path.join(output_dir, f"{file_name}_result.json")
     
-    # 모델 로딩
-    print("모델 로딩...")
-    yolo = YOLO(YOLO_WEIGHTS)
-    ocr_model = load_lprnet_model(OCR_WEIGHTS, DEVICE)
-    print("OCR 모델 로드 완료")
+    # 임시 AVI 파일 작성 (OpenCV 에러 방지를 위해 mp4v 사용)
+    temp_avi = result_video_path.replace('.mp4', '_temp.avi')
+    out = cv2.VideoWriter(temp_avi, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
 
-    # 비디오 열기
-    cap = cv2.VideoCapture(video_path)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
-    # 임시 AVI 파일로 저장 (XVID 코덱 - 호환성 좋음)
-    temp_video_path = result_video_path.replace('.mp4', '_temp.avi')
-    fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    out = cv2.VideoWriter(temp_video_path, fourcc, fps, (width, height))
-    
-    if not out.isOpened():
-        print("XVID 실패, MJPG 시도...")
-        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-        temp_video_path = result_video_path.replace('.mp4', '_temp.avi')
-        out = cv2.VideoWriter(temp_video_path, fourcc, fps, (width, height))
-    
-    print(f"VideoWriter 열림: {out.isOpened()}")
+    frame_cnt, json_results, rects_to_draw = 0, [], []
 
-    print("▶️ 실행 중...")
-    frame_cnt = 0
-    json_results = []
-    rects_to_draw = [] 
-
+    print("▶️ 분석 시작...")
     while True:
         ret, frame = cap.read()
-        if not ret: 
-            break
+        if not ret: break
         frame_cnt += 1
-        
-        current_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
-        time_str = get_time_str(current_ms)
+        time_str = get_time_str(cap.get(cv2.CAP_PROP_POS_MSEC))
         
         if frame_cnt % SKIP_FRAMES == 0:
             rects_to_draw = []
             detections = detect_with_slicing(yolo, frame, confidence=CONFIDENCE_THRESHOLD)
 
             for det in detections:
-                x1, y1, x2, y2, det_conf = list(map(int, det[:4])) + [det[4]]
+                x1, y1, x2, y2 = map(int, det[:4])
+                det_conf = det[4]
+
+                # ROI 추출 및 OCR 실행
+                roi = frame[max(0, y1-5):min(height, y2+5), max(0, x1-5):min(width, x2+5)]
+                if roi.size == 0: continue
                 
-                w_box, h_box = x2-x1, y2-y1
-                if w_box < 30 or h_box < 10: 
-                    continue
-
-                pad_w_left = int(w_box * 0.15)
-                pad_w_right = int(w_box * 0.05)
-                pad_h = int(h_box * 0.15)
-                
-                cx1 = max(0, x1 - pad_w_left)
-                cy1 = max(0, y1 - pad_h)
-                cx2 = min(width, x2 + pad_w_right)
-                cy2 = min(height, y2 + pad_h)
-                
-                plate_roi = frame[cy1:cy2, cx1:cx2]
-                if plate_roi.size == 0: 
-                    continue
-
-                if (cx2 - cx1) < 128:
-                    plate_roi = cv2.resize(plate_roi, dsize=(0,0), fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
-
-                plate_roi = transform_vertical_plate(plate_roi)
-                plate_roi = enhance_for_motion_blur(plate_roi)
-
-                text, ocr_conf = run_ocr(ocr_model, plate_roi)
+                roi = enhance_for_motion_blur(transform_vertical_plate(roi))
+                text, ocr_conf = run_ocr(ocr_model, ocr_converter, roi)
 
                 if text != "invalid" and ocr_conf >= OCR_CONFIDENCE_THRESHOLD:
-                    color = (0, 255, 0)
-                    label = f"Plate: {text}"
-                    print(f"👍 [{time_str}] {text} (Det: {det_conf:.2f}, OCR: {ocr_conf:.2f})")
+                    print(f"✨ [{time_str}] {text} (OCR: {ocr_conf:.2f})")
+                    cv2.imwrite(os.path.join(capture_dir, f"{text}_{frame_cnt}.jpg"), roi)
                     
-                    file_name = f"{text}_{frame_cnt}.jpg"
-                    cv2.imwrite(os.path.join(capture_dir, file_name), plate_roi)
-                    
-                    record = {
-                        "plate_number": text,
-                        "timestamp": time_str,
-                        "det_confidence": round(float(det_conf), 4),
-                        "ocr_confidence": round(float(ocr_conf), 4),
-                        "frame_index": frame_cnt,
-                        "bbox": [cx1, cy1, cx2, cy2],
-                        "image_base64": image_to_base64(plate_roi)
-                    }
-                    json_results.append(record)
-                    
-                    rects_to_draw.append({
-                        'coords': (x1, y1, x2, y2),
-                        'text': label,
-                        'color': color
+                    json_results.append({
+                        "plate_number": text, "timestamp": time_str,
+                        "ocr_confidence": round(ocr_conf, 4), "frame_index": frame_cnt,
+                        "image_base64": image_to_base64(roi)
                     })
+                    rects_to_draw.append({'coords': (x1, y1, x2, y2), 'text': text})
 
-        # 시각화
+        # 프레임에 결과 그리기
         for item in rects_to_draw:
-            rx1, ry1, rx2, ry2 = item['coords']
-            col = item['color']
-            txt = item['text']
-            cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), col, 3)
-            frame = draw_text(frame, txt, rx1, ry1, col)
+            ix1, iy1, ix2, iy2 = item['coords']
+            cv2.rectangle(frame, (ix1, iy1), (ix2, iy2), (0, 255, 0), 3)
+            frame = draw_text(frame, item['text'], ix1, iy1)
 
         out.write(frame)
-        
-        # 진행률 콜백
-        if progress_callback and frame_cnt % 1 == 0:
-            progress_callback(frame_cnt, total_frames)
-        
-        if frame_cnt % 1 == 0: 
-            print(f"Processing {frame_cnt}/{total_frames} ({time_str})...")
+        if progress_callback: progress_callback(frame_cnt, total_frames)
+        if frame_cnt % 50 == 0: print(f"진행 중... {frame_cnt}/{total_frames}")
 
     cap.release()
     out.release()
     
-    print(f"임시 영상 저장 완료: {temp_video_path}")
-    
-    # ffmpeg로 H.264 MP4 변환
-    print("H.264 코덱으로 변환 중...")
-    
+    # 6. 최종 MP4 변환 (H.264 코덱으로 웹 호환성 확보)
+    print("🎬 MP4 변환 및 최종 저장 중...")
     try:
-        import subprocess
-        import shutil
-        
-        # anaconda ffmpeg 경로 찾기
-        ffmpeg_path = shutil.which('ffmpeg')
-        if ffmpeg_path is None:
-            ffmpeg_path = 'ffmpeg'
-        
-        print(f"ffmpeg 경로: {ffmpeg_path}")
-        
-        cmd = [
-            ffmpeg_path, '-y',
-            '-i', temp_video_path,
-            '-vcodec', 'libx264',
-            '-preset', 'fast',
-            '-crf', '23',
-            '-pix_fmt', 'yuv420p',
-            result_video_path
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        if result.returncode == 0 and os.path.exists(result_video_path):
-            os.remove(temp_video_path)  # 임시 파일 삭제
-            print("H.264 변환 완료!")
-        else:
-            print(f"ffmpeg 변환 실패: {result.stderr}")
-            # 실패 시 임시 파일을 결과로 사용
-            if os.path.exists(temp_video_path):
-                os.rename(temp_video_path, result_video_path)
-    except Exception as e:
-        print(f"변환 중 오류: {e}")
-        if os.path.exists(temp_video_path):
-            os.rename(temp_video_path, result_video_path)
-    
-    # JSON 저장
-    print(f"JSON 파일 저장 중... (후처리 전: {len(json_results)}건)")
-    
-    # 후처리: 같은 프레임에서 동일한 번호판 중복 제거
-    def remove_duplicates(results):
-        """같은 프레임에서 동일한 번호판이 여러 번 검출된 경우, 신뢰도가 가장 높은 것만 유지"""
-        from collections import defaultdict
-        
-        # (frame_index, plate_number) 기준으로 그룹화
-        grouped = defaultdict(list)
-        for item in results:
-            key = (item["frame_index"], item["plate_number"])
-            grouped[key].append(item)
-        
-        # 각 그룹에서 ocr_confidence가 가장 높은 것만 선택
-        deduplicated = []
-        for key, items in grouped.items():
-            best = max(items, key=lambda x: x["ocr_confidence"])
-            deduplicated.append(best)
-        
-        # frame_index 순으로 정렬
-        deduplicated.sort(key=lambda x: x["frame_index"])
-        return deduplicated
-    
-    json_results = remove_duplicates(json_results)
-    print(f"후처리 완료: {len(json_results)}건")
+        ffmpeg_path = shutil.which('ffmpeg') or 'ffmpeg'
+        subprocess.run([ffmpeg_path, '-y', '-i', temp_avi, '-vcodec', 'libx264', '-pix_fmt', 'yuv420p', result_video_path], capture_output=True)
+        if os.path.exists(temp_avi): os.remove(temp_avi)
+    except:
+        os.rename(temp_avi, result_video_path)
+
     with open(result_json_path, 'w', encoding='utf-8') as f:
         json.dump(json_results, f, ensure_ascii=False, indent=4)
-        
-    print(f"모든 작업 완료!")
-    print(f"   - 결과 영상: {result_video_path}")
-    print(f"   - 결과 JSON: {result_json_path}")
     
+    print(f"✅ 모든 작업 완료! 결과: {result_video_path}")
     return result_video_path, result_json_path, json_results
 
-
-# =========================================================
-# 독립 실행 (command line 인자 지원)
-# =========================================================
 if __name__ == "__main__":
     import sys
     
+    # 아규먼트(인자)가 들어왔을 때만 실행
     if len(sys.argv) >= 3:
-        # command line에서 실행: python inference_module.py <video_path> <output_dir>
-        video_path = sys.argv[1]
-        output_dir = sys.argv[2]
+        input_video = sys.argv[1]
+        output_path = sys.argv[2]
+        print(f"DEBUG: 앱으로부터 인자 받음 - 파일: {input_video}, 경로: {output_path}")
+        run_plate_detection(input_video, output_path)
     else:
-        # 기본값
-        video_path = './주행.mp4'
-        output_dir = "results"
-    
-    run_plate_detection(video_path, output_dir)
+        # 인자가 없을 때(터미널에서 그냥 실행할 때)만 기본값 사용
+        print("DEBUG: 기본값으로 실행합니다.")
+        run_plate_detection('./주행.mp4', 'results')
