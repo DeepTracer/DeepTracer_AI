@@ -31,8 +31,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model", required=True, help="YOLO 모델 경로(.pt). OBB는 -obb 모델 권장")
     p.add_argument("--source", required=True, help="입력 비디오 경로/스트림")
     p.add_argument("--tracker", default="botsort.yaml", help="tracker yaml (botsort.yaml/bytetrack.yaml)")
-    p.add_argument("--imgsz", type=int, default=640)
-    p.add_argument("--conf", type=float, default=0.5)
+    p.add_argument("--imgsz", type=int, default=960)
+    p.add_argument("--conf", type=float, default=0.8)
     p.add_argument("--iou", type=float, default=0.5)
     p.add_argument("--device", default="0", help="Ultralytics device (0/cpu 등)")
 
@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
 
     # OBB warp
     p.add_argument("--use_obb_warp", action="store_true", help="OBB면 4점 warp 크롭 저장")
-    p.add_argument("--pad_ratio", type=float, default=0.08, help="AABB fallback padding 비율")
+    p.add_argument("--pad_ratio", type=float, default=0.18, help="AABB fallback padding 비율")
 
     return p.parse_args()
 
