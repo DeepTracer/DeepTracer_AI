@@ -222,4 +222,4 @@ captured_plates/
 *.json
 __pycache__/
 data/
-data_lmdb/
+data_lmdb/LPRNet/
